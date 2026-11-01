@@ -1,0 +1,133 @@
+name: Predictive maintenance ML pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - PredictiveMaintenance.ipynb
+      - streamlit_app.py
+      - requirements.txt
+      - data/engine_data.csv
+      - scripts/**
+      - tests/**
+      - .github/workflows/pipeline.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - PredictiveMaintenance.ipynb
+      - streamlit_app.py
+      - requirements.txt
+      - data/engine_data.csv
+      - scripts/**
+      - tests/**
+      - .github/workflows/pipeline.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: predictive-maintenance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  train-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up matching Python version
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install and check dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Validate, clean, and preprocess the dataset
+        run: python scripts/ml_pipeline.py prepare
+
+      - name: Create the stratified train-test split
+        run: python scripts/ml_pipeline.py split
+
+      - name: Compare models, tune the winner, and save the model
+        run: python scripts/ml_pipeline.py train
+
+      - name: Evaluate on the held-out test set and write metrics
+        run: python scripts/ml_pipeline.py evaluate
+
+      - name: Generate app code and pinned deployment dependencies
+        run: python scripts/ml_pipeline.py build
+
+      - name: Check Python syntax
+        run: python -m compileall -q scripts tests streamlit_app.py
+
+      - name: Test data validation, model outputs, and Streamlit inputs
+        run: python -m unittest discover -s tests -v
+
+      - name: Upload validated deployment files
+        uses: actions/upload-artifact@v4
+        with:
+          name: validated-deployment-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            streamlit_app.py
+            requirements.txt
+            models/best_engine_model.pkl
+            reports/metrics.json
+
+  update-main:
+    needs: train-test
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Download only this run's validated deployment
+        uses: actions/download-artifact@v4
+        with:
+          name: validated-deployment-${{ github.run_id }}
+          path: .
+
+      - name: Commit generated updates and push to main
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "$SOURCE_SHA" ]; then
+            echo "::error::main changed after training. Re-run on the latest main; stale results will not be pushed."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- streamlit_app.py requirements.txt models/best_engine_model.pkl reports/metrics.json
+          if git diff --cached --quiet; then
+            echo "No generated deployment changes to commit."
+            exit 0
+          else
+            diff_status=$?
+            if [ "$diff_status" -ne 1 ]; then
+              echo "::error::Unable to inspect staged changes; no deployment will be pushed."
+              exit "$diff_status"
+            fi
+          fi
+          git commit -m "Update generated app, dependencies, and ML artifacts" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+          git push origin HEAD:main
