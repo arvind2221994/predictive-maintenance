@@ -24,18 +24,19 @@ INPUT_SETTINGS = {
 
 
 @st.cache_resource
-def load_model():
+def load_model(model_file: str, model_revision: int):
+    # The revision participates in Streamlit's cache key when CI replaces the model.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", InconsistentVersionWarning)
+        return joblib.load(model_file)
+
+
+try:
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(
             "Missing models/best_engine_model.pkl. Commit the model saved by the notebook."
         )
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", InconsistentVersionWarning)
-        return joblib.load(MODEL_PATH)
-
-
-try:
-    model = load_model()
+    model = load_model(str(MODEL_PATH), MODEL_PATH.stat().st_mtime_ns)
 except (OSError, ImportError, ValueError, EOFError, UnpicklingError, InconsistentVersionWarning) as error:
     st.error(f"Unable to load the committed model: {error}")
     st.stop()
